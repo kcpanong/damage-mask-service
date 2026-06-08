@@ -11,8 +11,6 @@ def root():
 @app.post("/process-all")
 def process_all():
 
-    # call existing pipeline
-
     return {
-        "status": "success"
+        "status": "received"
     }
