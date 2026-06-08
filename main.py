@@ -2,15 +2,13 @@ import os
 import cv2
 import boto3
 import json
-import torch
 import requests
 import tempfile
 import firebase_admin
-import torch.nn as nn
 import numpy as np
+import onnxruntime as ort
 
 from PIL import Image
-from torchvision import transforms
 
 from firebase_admin import (
     credentials,
@@ -26,7 +24,7 @@ SERVICE_ACCOUNT_FILE = (
 )
 
 MODEL_PATH = (
-    "crack_seg_cnn.pth"
+    "crack_seg_cnn.onnx"
 )
 
 IDENTITY_POOL_ID = (
@@ -49,12 +47,6 @@ TEMP_DOWNLOAD_FOLDER = (
 
 TEMP_MASK_FOLDER = (
     "temp_masks"
-)
-
-DEVICE = torch.device(
-    "cuda"
-    if torch.cuda.is_available()
-    else "cpu"
 )
 
 # ==========================================================
@@ -137,159 +129,22 @@ os.makedirs(
 )
 
 # ==========================================================
-# 4. MODEL
+# 4. LOAD MODEL
 # ==========================================================
 
-class CrackSegCNN(nn.Module):
+print("\nLoading ONNX model...")
 
-    def __init__(self):
-        super(CrackSegCNN, self).__init__()
-
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(
-                3,
-                32,
-                kernel_size=3,
-                padding=1
-            ),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-
-        self.enc2 = nn.Sequential(
-            nn.Conv2d(
-                32,
-                64,
-                kernel_size=3,
-                padding=1
-            ),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-
-        self.enc3 = nn.Sequential(
-            nn.Conv2d(
-                64,
-                128,
-                kernel_size=3,
-                padding=1
-            ),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-
-        self.up1 = nn.ConvTranspose2d(
-            128,
-            64,
-            kernel_size=2,
-            stride=2
-        )
-
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(
-                128,
-                64,
-                kernel_size=3,
-                padding=1
-            ),
-            nn.ReLU()
-        )
-
-        self.up2 = nn.ConvTranspose2d(
-            64,
-            32,
-            kernel_size=2,
-            stride=2
-        )
-
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(
-                64,
-                32,
-                kernel_size=3,
-                padding=1
-            ),
-            nn.ReLU()
-        )
-
-        self.up3 = nn.ConvTranspose2d(
-            32,
-            1,
-            kernel_size=2,
-            stride=2
-        )
-
-    def forward_encoder(self, x):
-
-        e1 = self.enc1(x)
-        e2 = self.enc2(e1)
-        e3 = self.enc3(e2)
-
-        return e1, e2, e3
-
-    def forward(self, x):
-
-        e1, e2, e3 = self.forward_encoder(x)
-
-        x = self.up1(e3)
-
-        x = torch.cat(
-            [x, e2],
-            dim=1
-        )
-
-        x = self.conv1(x)
-
-        x = self.up2(x)
-
-        x = torch.cat(
-            [x, e1],
-            dim=1
-        )
-
-        x = self.conv2(x)
-
-        x = self.up3(x)
-
-        return torch.sigmoid(x)
-
-# ==========================================================
-# 5. TRANSFORM
-# ==========================================================
-
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(
-        (0.5,),
-        (0.5,)
-    )
-])
-
-# ==========================================================
-# 6. LOAD MODEL
-# ==========================================================
-
-print("\nLoading model...")
-
-model = CrackSegCNN().to(
-    DEVICE
+session = ort.InferenceSession(
+    MODEL_PATH,
+    providers=["CPUExecutionProvider"]
 )
 
-model.load_state_dict(
-    torch.load(
-        MODEL_PATH,
-        map_location=DEVICE
-    )
-)
+input_name = session.get_inputs()[0].name
 
-model.eval()
-
-print(
-    f"Model loaded on {DEVICE}"
-)
+print("ONNX model loaded.")
 
 # ==========================================================
-# 7. GET AWS TEMP CREDS
+# 5. GET AWS TEMP CREDS
 # ==========================================================
 
 print(
@@ -338,7 +193,7 @@ s3 = boto3.client(
 )
 
 # ==========================================================
-# 8. FIRESTORE QUERY
+# 6. FIRESTORE QUERY
 # ==========================================================
 
 def get_unprocessed_crops():
@@ -399,7 +254,7 @@ def get_unprocessed_crops():
     return results
 
 # ==========================================================
-# 9. DOWNLOAD
+# 7. DOWNLOAD
 # ==========================================================
 
 def sanitize_filename(
@@ -451,7 +306,7 @@ def download_image(
         )
 
 # ==========================================================
-# 10. SEGMENT
+# 8. SEGMENT
 # ==========================================================
 
 def create_mask(
@@ -461,35 +316,50 @@ def create_mask(
 
     image = Image.open(
         image_path
-    ).convert(
-        "RGB"
-    )
+    ).convert("RGB")
 
     image = image.resize(
-        (
-            IMG_SIZE,
-            IMG_SIZE
-        )
+        (IMG_SIZE, IMG_SIZE)
     )
 
-    tensor = (
-        transform(
-            image
-        )
-        .unsqueeze(0)
-        .to(DEVICE)
+    image_np = np.array(
+        image
+    ).astype(
+        np.float32
     )
 
-    with torch.no_grad():
+    image_np = (
+        image_np / 255.0
+    )
 
-        pred = model(
-            tensor
-        )
+    image_np = (
+        image_np - 0.5
+    ) / 0.5
 
-    prob_map = (
-        pred.squeeze()
-        .cpu()
-        .numpy()
+    image_np = np.transpose(
+        image_np,
+        (2, 0, 1)
+    )
+
+    image_np = np.expand_dims(
+        image_np,
+        axis=0
+    )
+
+    outputs = session.run(
+        None,
+        {
+            input_name:
+                image_np.astype(
+                    np.float32
+                )
+        }
+    )
+
+    prob_map = outputs[0]
+
+    prob_map = np.squeeze(
+        prob_map
     )
 
     mask = (
@@ -504,7 +374,7 @@ def create_mask(
     )
 
 # ==========================================================
-# 11. S3 UPLOAD
+# 9. S3 UPLOAD
 # ==========================================================
 
 def upload_mask(
@@ -537,7 +407,7 @@ def upload_mask(
     )
 
 # ==========================================================
-# 12. UPDATE FIRESTORE
+# 10. UPDATE FIRESTORE
 # ==========================================================
 
 def mark_processed(
@@ -562,7 +432,7 @@ def mark_processed(
     })
 
 # ==========================================================
-# 13. PROCESS PIPELINE
+# 11. PROCESS PIPELINE
 # ==========================================================
 
 def process_all_crops():
@@ -694,7 +564,7 @@ def process_all_crops():
 
 
 # ==========================================================
-# 14. LOCAL EXECUTION
+# 12. LOCAL EXECUTION
 # ==========================================================
 
 if __name__ == "__main__":
