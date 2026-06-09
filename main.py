@@ -196,15 +196,10 @@ s3 = boto3.client(
 # 6. FIRESTORE QUERY
 # ==========================================================
 
-def get_unprocessed_crops():
+def get_unprocessed_images():
 
     docs = (
         db.collection("images")
-        .where(
-            "type",
-            "==",
-            "cropped"
-        )
         .stream()
     )
 
@@ -213,6 +208,16 @@ def get_unprocessed_crops():
     for doc in docs:
 
         data = doc.to_dict()
+
+        image_type = data.get(
+            "type"
+        )
+
+        if image_type not in (
+            "original",
+            "resized"
+        ):
+            continue
 
         if data.get(
             "retrievedForProcessing",
@@ -235,15 +240,18 @@ def get_unprocessed_crops():
                     "sessionId"
                 ),
 
-            "cropped_id":
+            "original_id":
                 data.get(
-                    "cropped_id"
+                    "original_id"
                 ),
 
             "filename":
                 data.get(
                     "filename"
                 ),
+
+            "type":
+                image_type,
 
             "storageUrl":
                 data.get(
@@ -380,13 +388,13 @@ def create_mask(
 def upload_mask(
     mask_path,
     session_id,
-    cropped_id
+    image_id
 ):
 
     s3_key = (
         f"masks/"
         f"{session_id}/"
-        f"{cropped_id}_mask.png"
+        f"{image_id}_mask.png"
     )
 
     s3.upload_file(
@@ -412,57 +420,50 @@ def upload_mask(
 
 def mark_processed(
     doc_ref,
-    mask_key,
     mask_url
 ):
 
     doc_ref.update({
 
-        "maskS3Key":
-            mask_key,
-
         "maskS3Url":
             mask_url,
 
         "retrievedForProcessing":
-            True,
-
-        "processedAt":
-            firestore.SERVER_TIMESTAMP
+            True
     })
 
 # ==========================================================
 # 11. PROCESS PIPELINE
 # ==========================================================
 
-def process_all_crops():
+def process_all_images():
 
-    crops = (
-        get_unprocessed_crops()
+    images = (
+        get_unprocessed_images()
     )
 
     print(
         f"\nFound "
-        f"{len(crops)} "
-        f"crops to process.\n"
+        f"{len(images)} "
+        f"images to process.\n"
     )
 
     processed_count = 0
 
-    for index, crop in enumerate(
-        crops,
+    for index, image in enumerate(
+        images,
         start=1
     ):
 
         print(
-            f"\n[{index}/{len(crops)}]"
+            f"\n[{index}/{len(images)}]"
         )
 
         try:
 
             safe_filename = (
                 sanitize_filename(
-                    crop["filename"]
+                    image["filename"]
                 )
             )
 
@@ -471,12 +472,14 @@ def process_all_crops():
                 safe_filename
             )
 
+            image_id = (
+                f"{image['type']}_"
+                f"{image['original_id']}"
+            )
+
             local_mask = os.path.join(
                 TEMP_MASK_FOLDER,
-                (
-                    crop["cropped_id"]
-                    + "_mask.png"
-                )
+                image_id + "_mask.png"
             )
 
             print(
@@ -484,7 +487,7 @@ def process_all_crops():
             )
 
             download_image(
-                crop["storageUrl"],
+                image["storageUrl"],
                 local_image
             )
 
@@ -502,19 +505,17 @@ def process_all_crops():
             )
 
             (
-                mask_key,
+                _,
                 mask_url
             ) = upload_mask(
 
                 local_mask,
 
-                crop[
+                image[
                     "sessionId"
                 ],
 
-                crop[
-                    "cropped_id"
-                ]
+                image_id
             )
 
             print(
@@ -523,11 +524,9 @@ def process_all_crops():
 
             mark_processed(
 
-                crop[
+                image[
                     "doc_ref"
                 ],
-
-                mask_key,
 
                 mask_url
             )
@@ -550,7 +549,7 @@ def process_all_crops():
             processed_count,
 
         "total":
-            len(crops)
+            len(images)
 
     }
 
@@ -569,4 +568,4 @@ def process_all_crops():
 
 if __name__ == "__main__":
 
-    process_all_crops()
+    process_all_images()
